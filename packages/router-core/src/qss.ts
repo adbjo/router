@@ -49,7 +49,7 @@ export function encode(
 export function decode(str: any): any {
   const searchParams = new URLSearchParams(str)
 
-  const result: Record<string, unknown> = {}
+  const result: Record<string, unknown> = Object.create(null)
 
   for (const [key, value] of searchParams.entries()) {
     const previousValue = result[key]

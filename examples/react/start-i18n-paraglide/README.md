@@ -1,6 +1,6 @@
 # TanStack Start example with Paraglide
 
-This example shows how to use Paraglide with TanStack Start. The source code can be found [in the Paraglide monorepo](https://github.com/opral/monorepo/tree/main/inlang/packages/paraglide/paraglide-js/examples/tanstack-start).
+This example shows how to use Paraglide with TanStack Start.
 
 - [TanStack Router Docs](https://tanstack.com/router)
 - [Paraglide Documentation](https://inlang.com/m/gerre34r/library-inlang-paraglideJs)
@@ -81,7 +81,7 @@ import { paraglideMiddleware } from './paraglide/server.js'
 import handler from '@tanstack/react-start/server-entry'
 export default {
   fetch(req: Request): Promise<Response> {
-    return paraglideMiddleware(req, ({ request }) => handler.fetch(request))
+    return paraglideMiddleware(req, () => handler.fetch(req))
   },
 }
 ```
@@ -130,6 +130,7 @@ export const Route = createRootRoute({
 If you don't want to miss any translated path, you can create a `createTranslatedPathnames` function and pass it to the vite plugin.
 
 ```ts
+// i18n/lib.ts
 import { Locale } from '@/paraglide/runtime'
 import { FileRoutesByTo } from '../routeTree.gen'
 
@@ -189,6 +190,20 @@ export const translatedPathnames = createTranslatedPathnames({
 ```
 
 And import into the Paraglide Vite plugin.
+
+```ts
+// vite.config.ts
+import { translatedPathnames } from './i18n/lib'
+
+export default defineConfig({
+  plugins: [
+    paraglideVitePlugin({
+      // ... other options
+      urlPatterns: translatedPathnames,
+    }),
+  ],
+})
+```
 
 ## Prerender routes
 

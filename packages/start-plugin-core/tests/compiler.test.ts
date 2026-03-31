@@ -1,12 +1,23 @@
 import { describe, expect, test } from 'vitest'
 import {
+  StartCompiler,
   detectKindsInCode,
-  ServerFnCompiler,
-} from '../src/create-server-fn-plugin/compiler'
+} from '../src/start-compiler-plugin/compiler'
 import type {
   LookupConfig,
   LookupKind,
-} from '../src/create-server-fn-plugin/compiler'
+} from '../src/start-compiler-plugin/compiler'
+
+// Default test options for StartCompiler
+function getDefaultTestOptions(env: 'client' | 'server') {
+  const envName = env === 'client' ? 'client' : 'ssr'
+  return {
+    envName,
+    root: '/test',
+    framework: 'react' as const,
+    providerEnvName: 'ssr',
+  }
+}
 
 // Helper to create a compiler with all kinds enabled
 function createFullCompiler(env: 'client' | 'server') {
@@ -49,9 +60,9 @@ function createFullCompiler(env: 'client' | 'server') {
     },
   ]
 
-  return new ServerFnCompiler({
+  return new StartCompiler({
     env,
-    directive: 'use server',
+    ...getDefaultTestOptions(env),
     lookupKinds,
     lookupConfigurations,
     loadModule: async () => {},
@@ -190,6 +201,37 @@ describe('detectKindsInCode', () => {
       expect(detectKindsInCode(code4, 'client')).toEqual(new Set(['ServerFn']))
     })
 
+    test('handles whitespace between . and handler (reformatted code)', () => {
+      // When Vite/Babel reformats code, the dot can end up on a previous line
+      const code1 = `fn.\nhandler(() => {})`
+      const code2 = `fn.\n  handler(() => {})`
+      const code3 = `fn.  \n  handler(() => {})`
+
+      expect(detectKindsInCode(code1, 'client')).toEqual(new Set(['ServerFn']))
+      expect(detectKindsInCode(code2, 'client')).toEqual(new Set(['ServerFn']))
+      expect(detectKindsInCode(code3, 'client')).toEqual(new Set(['ServerFn']))
+    })
+
+    test('detects createServerFn() call directly', () => {
+      // The pattern should match createServerFn() calls, not just .handler()
+      const code = `
+        import { createServerFn } from '@tanstack/react-start'
+        const fn = createServerFn()
+      `
+      expect(detectKindsInCode(code, 'client')).toEqual(new Set(['ServerFn']))
+    })
+
+    test('does not false positive on similar function names', () => {
+      // Only exact createServerFn( should match, not variations
+      const code = `
+        const fn = createServerFnExample()
+        const fn2 = createServerFnLike()
+        const fn3 = mycreateServerFn()
+        const fn4 = _createServerFn()
+      `
+      expect(detectKindsInCode(code, 'client')).toEqual(new Set())
+    })
+
     test('does not false positive on similar names', () => {
       const code = `
         const myCreateServerFn = () => {}
@@ -214,11 +256,11 @@ describe('compiler handles multiple files with different kinds', () => {
         export const fn = createServerFn().handler(() => 'hello')
       `,
       id: 'file1.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['ServerFn']),
     })
     expect(result1).not.toBeNull()
-    expect(result1!.code).toContain('__executeServer') // Client should have RPC stub
+    expect(result1!.code).toContain('createClientRpc') // Client should have RPC stub
     expect(result1!.code).not.toContain('createMiddleware')
     expect(result1!.code).not.toContain('createIsomorphicFn')
 
@@ -232,7 +274,7 @@ describe('compiler handles multiple files with different kinds', () => {
         })
       `,
       id: 'file2.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['Middleware']),
     })
     expect(result2).not.toBeNull()
@@ -249,7 +291,7 @@ describe('compiler handles multiple files with different kinds', () => {
           .server(() => 'server-value')
       `,
       id: 'file3.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['IsomorphicFn']),
     })
     expect(result3).not.toBeNull()
@@ -264,7 +306,7 @@ describe('compiler handles multiple files with different kinds', () => {
         export const fn = createServerOnlyFn(() => 'server only value')
       `,
       id: 'file4.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['ServerOnlyFn']),
     })
     expect(result4).not.toBeNull()
@@ -280,11 +322,11 @@ describe('compiler handles multiple files with different kinds', () => {
         export const isoFn = createIsomorphicFn().client(() => 'client-iso')
       `,
       id: 'file5.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['ServerFn', 'IsomorphicFn']),
     })
     expect(result5).not.toBeNull()
-    expect(result5!.code).toContain('__executeServer') // ServerFn RPC
+    expect(result5!.code).toContain('createClientRpc') // ServerFn RPC
     expect(result5!.code).toContain('client-iso') // IsomorphicFn client impl
   })
 
@@ -298,7 +340,7 @@ describe('compiler handles multiple files with different kinds', () => {
         export const fn1 = createIsomorphicFn().client(() => 'first')
       `,
       id: 'first.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['IsomorphicFn']),
     })
     expect(result1!.code).toContain('first')
@@ -310,7 +352,7 @@ describe('compiler handles multiple files with different kinds', () => {
         export const fn2 = createIsomorphicFn().client(() => 'second')
       `,
       id: 'second.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['IsomorphicFn']),
     })
     expect(result2!.code).toContain('second')
@@ -327,7 +369,7 @@ describe('compiler handles multiple files with different kinds', () => {
         export const mw = createMiddleware().server(({ next }) => next())
       `,
       id: 'middleware.ts',
-      isProviderFile: false,
+
       // Intentionally including Middleware even though it's server env
       detectedKinds: new Set(['Middleware']),
     })
@@ -348,7 +390,7 @@ describe('edge cases for detectedKinds', () => {
         // .handler( in string
       `,
       id: 'empty.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(), // Empty set
     })
 
@@ -365,7 +407,7 @@ describe('edge cases for detectedKinds', () => {
         export const fn = createIsomorphicFn().client(() => 'works')
       `,
       id: 'no-detected.ts',
-      isProviderFile: false,
+
       // No detectedKinds provided
     })
 
@@ -383,7 +425,7 @@ describe('edge cases for detectedKinds', () => {
         export const fn = createIsomorphicFn().server(() => 'server-impl')
       `,
       id: 'filtered.ts',
-      isProviderFile: false,
+
       detectedKinds: new Set(['Middleware', 'IsomorphicFn']), // Middleware should be filtered
     })
 
@@ -393,9 +435,9 @@ describe('edge cases for detectedKinds', () => {
 })
 
 test('ingestModule handles empty code gracefully', () => {
-  const compiler = new ServerFnCompiler({
+  const compiler = new StartCompiler({
     env: 'client',
-    directive: 'use server',
+    ...getDefaultTestOptions('client'),
     lookupKinds: new Set(['ServerFn']),
     lookupConfigurations: [],
     loadModule: async () => {},
@@ -411,4 +453,277 @@ test('ingestModule handles empty code gracefully', () => {
   expect(() => {
     compiler.ingestModule({ code: '   \n\t  ', id: 'whitespace.ts' })
   }).not.toThrow()
+})
+
+describe('calling result of createServerOnlyFn/createClientOnlyFn', () => {
+  // This tests the fix for https://github.com/TanStack/router/issues/6643
+  // When a file has both createServerFn and createServerOnlyFn, and the result
+  // of createServerOnlyFn is invoked (e.g., `const result = myServerOnlyFn()`),
+  // the compiler should NOT treat that invocation as a ServerOnlyFn candidate.
+  // The var binding holds the RESULT of the factory, not the factory itself.
+
+  test('invocation of createServerOnlyFn result is not treated as a candidate', async () => {
+    const compiler = createFullCompiler('server')
+
+    const code = `
+      import { createServerFn, createServerOnlyFn } from '@tanstack/react-start'
+
+      const createRandomNumber = createServerOnlyFn(() => Math.floor(Math.random() * 100))
+      const randomNumber = createRandomNumber()
+
+      export const personServerFn = createServerFn({ method: 'GET' })
+        .handler(({ data: name }) => {
+          return { name, randomNumber }
+        })
+    `
+
+    // Should NOT throw "createServerOnlyFn() must be called with a function!"
+    // The main file output is the split-file version (createServerFn splits the handler),
+    // so we just verify it compiles without error and produces valid output.
+    const result = await compiler.compile({ code, id: 'test-6643.ts' })
+    expect(result).not.toBeNull()
+    // The output should contain the personServerFn export (with SSR RPC reference)
+    expect(result!.code).toContain('personServerFn')
+  })
+
+  test('invocation of createClientOnlyFn result is not treated as a candidate', async () => {
+    const compiler = createFullCompiler('client')
+
+    const code = `
+      import { createClientOnlyFn, createServerFn } from '@tanstack/react-start'
+
+      const getWindowWidth = createClientOnlyFn(() => window.innerWidth)
+      const width = getWindowWidth()
+
+       export const personServerFn = createServerFn({ method: 'GET' })
+        .handler(({ data: name }) => {
+          return { name }
+        })
+    `
+
+    const result = await compiler.compile({ code, id: 'test-6643-client.ts' })
+    expect(result).not.toBeNull()
+    expect(result!.code).toContain('window.innerWidth')
+    expect(result!.code).toContain('getWindowWidth()')
+  })
+
+  test('re-exported createServerOnlyFn still resolves correctly', async () => {
+    // Ensure the fix doesn't break re-export chain resolution (issue #6583)
+    const virtualModules: Record<string, string> = {
+      '@tanstack/start-client-core': `
+        export { createServerOnlyFn } from '@tanstack/start-fn-stubs'
+      `,
+    }
+
+    const compiler: StartCompiler = new StartCompiler({
+      env: 'server',
+      envName: 'ssr',
+      root: '/test',
+      framework: 'react' as const,
+      providerEnvName: 'ssr',
+      lookupKinds: new Set(['ServerOnlyFn', 'ClientOnlyFn']),
+      lookupConfigurations: [],
+      loadModule: async (id) => {
+        const code = virtualModules[id]
+        if (code) {
+          compiler.ingestModule({ code, id })
+        }
+      },
+      resolveId: async (id) => {
+        return virtualModules[id] ? id : null
+      },
+    })
+
+    const code = `
+      import { createServerOnlyFn } from '@tanstack/start-client-core'
+      const myFn = createServerOnlyFn(() => 'server-only-value')
+    `
+
+    const result = await compiler.compile({ code, id: 'reexport-test.ts' })
+    expect(result).not.toBeNull()
+    expect(result!.code).toContain('server-only-value')
+  })
+
+  test('aliased factory is still detected as a candidate', async () => {
+    // `const createSO = createServerOnlyFn` is an alias, not an invocation.
+    // `createSO(() => ...)` should still be treated as ServerOnlyFn.
+    const compiler = createFullCompiler('server')
+
+    const code = `
+      import { createServerOnlyFn } from '@tanstack/react-start'
+
+      const createSO = createServerOnlyFn
+      const myFn = createSO(() => 'aliased-server-only')
+    `
+
+    const result = await compiler.compile({ code, id: 'alias-test.ts' })
+    expect(result).not.toBeNull()
+    // The factory should be unwrapped on server env
+    expect(result!.code).toContain('aliased-server-only')
+  })
+})
+
+describe('re-export chain resolution', () => {
+  // This tests the fix for https://github.com/TanStack/router/issues/6583
+  // Third-party packages may import from @tanstack/start-client-core (which re-exports
+  // from @tanstack/start-fn-stubs) rather than directly from @tanstack/react-start.
+  // The compiler should correctly resolve these imports via the slow path.
+
+  // Virtual module contents for simulating the re-export chain:
+  // @third-party/lib -> @tanstack/start-client-core -> @tanstack/start-fn-stubs
+  //
+  // Note: We don't need a virtual module for @tanstack/start-fn-stubs because
+  // init() hardcodes it in knownRootImports. When the slow path resolution reaches
+  // that package, it uses the fast path lookup and never needs to parse the module.
+  const virtualModules: Record<string, string> = {
+    // The client-core package that re-exports from stubs
+    '@tanstack/start-client-core': `
+      export { createIsomorphicFn, createServerOnlyFn, createClientOnlyFn } from '@tanstack/start-fn-stubs'
+    `,
+    // A third-party package that imports from start-client-core
+    '@third-party/lib': `
+      import { createIsomorphicFn, createClientOnlyFn } from '@tanstack/start-client-core'
+
+      export const getThemeData = createIsomorphicFn()
+        .client(() => 'client-theme')
+        .server(() => 'server-theme')
+
+      export const initClientFeature = createClientOnlyFn(() => {
+        console.log('client only initialization')
+        return 'initialized'
+      })
+    `,
+  }
+
+  function createCompilerWithVirtualModules(env: 'client' | 'server') {
+    const envName = env === 'client' ? 'client' : 'ssr'
+    const lookupKinds: Set<LookupKind> = new Set([
+      'IsomorphicFn',
+      'ServerOnlyFn',
+      'ClientOnlyFn',
+    ])
+
+    // Note: We use empty lookupConfigurations because this test is specifically
+    // testing the slow path resolution through re-export chains. The compiler
+    // should still work because @tanstack/start-fn-stubs is hardcoded in
+    // knownRootImports during init().
+    const compiler: StartCompiler = new StartCompiler({
+      env,
+      envName,
+      root: '/test',
+      framework: 'react' as const,
+      providerEnvName: 'ssr',
+      lookupKinds,
+      lookupConfigurations: [],
+      loadModule: async (id) => {
+        const code = virtualModules[id]
+        if (code) {
+          compiler.ingestModule({ code, id })
+        }
+      },
+      resolveId: async (id) => {
+        return virtualModules[id] ? id : null
+      },
+    })
+
+    return compiler
+  }
+
+  const testCases: Array<{
+    env: 'client' | 'server'
+    fn: string
+    shouldContain: Array<string>
+    shouldNotContain: Array<string>
+  }> = [
+    {
+      env: 'client',
+      fn: 'createIsomorphicFn',
+      shouldContain: ['client-theme'],
+      shouldNotContain: ['server-theme'],
+    },
+    {
+      env: 'server',
+      fn: 'createIsomorphicFn',
+      shouldContain: ['server-theme'],
+      shouldNotContain: ['client-theme'],
+    },
+    {
+      env: 'client',
+      fn: 'createClientOnlyFn',
+      shouldContain: ['client only initialization'],
+      shouldNotContain: [],
+    },
+    {
+      env: 'server',
+      fn: 'createClientOnlyFn',
+      shouldContain: ['throw new Error'],
+      shouldNotContain: ['client only initialization'],
+    },
+  ]
+
+  test.each(testCases)(
+    'resolves $fn via re-export chain on $env',
+    async ({ env, shouldContain, shouldNotContain }) => {
+      const compiler = createCompilerWithVirtualModules(env)
+      const code = virtualModules['@third-party/lib']!
+
+      const result = await compiler.compile({
+        code,
+        id: '@third-party/lib',
+      })
+
+      expect(result).not.toBeNull()
+      for (const str of shouldContain) {
+        expect(result!.code).toContain(str)
+      }
+      for (const str of shouldNotContain) {
+        expect(result!.code).not.toContain(str)
+      }
+    },
+  )
+
+  test('handles deeper re-export chains', async () => {
+    // Add another level to the chain
+    const deeperVirtualModules: Record<string, string> = {
+      ...virtualModules,
+      // Another intermediate package
+      '@another-intermediate/pkg': `
+        export { createIsomorphicFn } from '@tanstack/start-client-core'
+      `,
+      '@deep-third-party/lib': `
+        import { createIsomorphicFn } from '@another-intermediate/pkg'
+        export const deepFn = createIsomorphicFn()
+          .client(() => 'deep-client')
+          .server(() => 'deep-server')
+      `,
+    }
+
+    const compiler: StartCompiler = new StartCompiler({
+      env: 'client',
+      envName: 'client',
+      root: '/test',
+      framework: 'react' as const,
+      providerEnvName: 'ssr',
+      lookupKinds: new Set(['IsomorphicFn', 'ServerOnlyFn', 'ClientOnlyFn']),
+      lookupConfigurations: [],
+      loadModule: async (id) => {
+        const code = deeperVirtualModules[id]
+        if (code) {
+          compiler.ingestModule({ code, id })
+        }
+      },
+      resolveId: async (id) => {
+        return deeperVirtualModules[id] ? id : null
+      },
+    })
+
+    const result = await compiler.compile({
+      code: deeperVirtualModules['@deep-third-party/lib']!,
+      id: '@deep-third-party/lib',
+    })
+
+    expect(result).not.toBeNull()
+    expect(result!.code).toContain('deep-client')
+    expect(result!.code).not.toContain('deep-server')
+  })
 })

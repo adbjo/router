@@ -1,12 +1,11 @@
 import { joinPaths } from '@tanstack/router-core'
-import { VIRTUAL_MODULES } from '@tanstack/start-server-core'
-import { TanStackServerFnPlugin } from '@tanstack/server-functions-plugin'
 import * as vite from 'vite'
 import { crawlFrameworkPkgs } from 'vitefu'
 import { join } from 'pathe'
 import { escapePath } from 'tinyglobby'
 import { startManifestPlugin } from './start-manifest-plugin/plugin'
 import { ENTRY_POINTS, VITE_ENVIRONMENT_NAMES } from './constants'
+import { getBundlerOptions } from './utils'
 import { tanStackStartRouter } from './start-router-plugin/plugin'
 import { loadEnvPlugin } from './load-env-plugin/plugin'
 import { devServerPlugin } from './dev-server-plugin/plugin'
@@ -18,7 +17,8 @@ import {
   getServerOutputDirectory,
 } from './output-directory'
 import { postServerBuild } from './post-server-build'
-import { createServerFnPlugin } from './create-server-fn-plugin/plugin'
+import { startCompilerPlugin } from './start-compiler-plugin/plugin'
+import { importProtectionPlugin } from './import-protection-plugin/plugin'
 import type {
   GetConfigFn,
   ResolvedStartConfig,
@@ -59,8 +59,6 @@ export function TanStackStartVitePluginCore(
     serverFnProviderEnv,
   }
 
-  const directive = corePluginOpts.serverFn?.directive ?? 'use server'
-
   let startConfig: TanStackStartOutputConfig | null
   const getConfig: GetConfigFn = () => {
     if (!resolvedStartConfig.root) {
@@ -75,6 +73,10 @@ export function TanStackStartVitePluginCore(
     }
     return { startConfig, resolvedStartConfig, corePluginOpts }
   }
+
+  // When the router basepath and vite base are misaligned during dev,
+  // we install a URL rewrite middleware instead of erroring.
+  let needsDevBaseRewrite = false
 
   const capturedBundle: Partial<
     Record<ViteEnvironmentNames, vite.Rollup.OutputBundle>
@@ -133,9 +135,12 @@ export function TanStackStartVitePluginCore(
                 joinPaths(['/', resolvedStartConfig.viteAppBase, '/']),
               )
             ) {
-              this.error(
-                '[tanstack-start]: During `vite dev`, `router.basepath` must start with the vite `base` config value',
-              )
+              // The router basepath and vite base are misaligned.
+              // Instead of erroring, we install a dev-server middleware that
+              // rewrites incoming request URLs to prepend the vite base prefix.
+              // This allows users to have e.g. base: '/_ui/' for asset URLs
+              // while keeping router basepath at '/' for page navigation.
+              needsDevBaseRewrite = true
             }
           }
         }
@@ -239,14 +244,21 @@ export function TanStackStartVitePluginCore(
           environments: {
             [VITE_ENVIRONMENT_NAMES.client]: {
               consumer: 'client',
-              build: {
-                rollupOptions: {
+              build: (() => {
+                // Use the same object reference for both keys to avoid
+                // Vite 8's deprecation warning when both are present.
+                // Vite 7 reads rollupOptions, Vite 8 reads rolldownOptions.
+                const bundlerOptions = {
                   input: {
                     main: ENTRY_POINTS.client,
                   },
-                },
-                outDir: getClientOutputDirectory(viteConfig),
-              },
+                }
+                return {
+                  rollupOptions: bundlerOptions,
+                  rolldownOptions: bundlerOptions,
+                  outDir: getClientOutputDirectory(viteConfig),
+                }
+              })(),
               optimizeDeps: {
                 exclude: crawlFrameworkPkgsResult.optimizeDeps.exclude,
                 // Ensure user code can be crawled for dependencies
@@ -260,11 +272,19 @@ export function TanStackStartVitePluginCore(
               consumer: 'server',
               build: {
                 ssr: true,
-                rollupOptions: {
-                  input:
-                    viteConfig.environments?.[VITE_ENVIRONMENT_NAMES.server]
-                      ?.build?.rollupOptions?.input ?? serverAlias,
-                },
+                ...(() => {
+                  const bundlerOptions = {
+                    input:
+                      getBundlerOptions(
+                        viteConfig.environments?.[VITE_ENVIRONMENT_NAMES.server]
+                          ?.build,
+                      )?.input ?? serverAlias,
+                  }
+                  return {
+                    rollupOptions: bundlerOptions,
+                    rolldownOptions: bundlerOptions,
+                  }
+                })(),
                 outDir: getServerOutputDirectory(viteConfig),
                 commonjsOptions: {
                   include: [/node_modules/],
@@ -301,10 +321,16 @@ export function TanStackStartVitePluginCore(
             // This is not the same as injecting environment variables.
 
             ...defineReplaceEnv('TSS_SERVER_FN_BASE', TSS_SERVER_FN_BASE),
-            ...defineReplaceEnv('TSS_CLIENT_OUTPUT_DIR', getClientOutputDirectory(viteConfig)),
             ...defineReplaceEnv('TSS_ROUTER_BASEPATH', startConfig.router.basepath),
             ...(command === 'serve' ? defineReplaceEnv('TSS_SHELL', startConfig.spa?.enabled ? 'true' : 'false') : {}),
             ...defineReplaceEnv('TSS_DEV_SERVER', command === 'serve' ? 'true' : 'false'),
+            // Dev SSR styles: enabled flag and basepath (defaults to vite base for asset URL alignment)
+            ...defineReplaceEnv('TSS_DEV_SSR_STYLES_ENABLED', startConfig.dev.ssrStyles.enabled ? 'true' : 'false'),
+            ...defineReplaceEnv('TSS_DEV_SSR_STYLES_BASEPATH', startConfig.dev.ssrStyles.basepath ?? resolvedStartConfig.viteAppBase),
+            // Replace NODE_ENV during build (unless opted out) for dead code elimination in server bundles
+            ...(command === 'build' && startConfig.server.build.staticNodeEnv ? {
+              'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV || viteConfig.mode || 'production'),
+            } : {}),
           },
           builder: {
             sharedPlugins: true,
@@ -348,6 +374,14 @@ export function TanStackStartVitePluginCore(
           },
         }
       },
+    },
+    // Separate plugin for buildApp hook with enforce: 'post'
+    // This ensures proper ordering with other plugins that also have
+    // buildApp hooks with order: 'post'. The enforce: 'post' ensures this
+    // runs after other plugins (like Nitro) complete their builds.
+    {
+      name: 'tanstack-start-core:post-build',
+      enforce: 'post',
       buildApp: {
         order: 'post',
         async handler(builder) {
@@ -356,61 +390,55 @@ export function TanStackStartVitePluginCore(
         },
       },
     },
-    tanStackStartRouter(startPluginOpts, getConfig, corePluginOpts),
-    // N.B. Server function plugins must run BEFORE startCompilerPlugin because:
-    // 1. createServerFnPlugin transforms createServerFn().handler() to inject 'use server' directive
-    // 2. TanStackServerFnPlugin extracts 'use server' functions and registers them in the manifest
-    // 3. startCompilerPlugin handles createClientOnlyFn/createServerOnlyFn and runs DCE
-    // If startCompilerPlugin runs first, DCE may remove server function code before it can be registered
-    // (e.g., when a server function is only referenced inside a createClientOnlyFn callback)
-    createServerFnPlugin({
+    // Server function plugin handles:
+    // 1. Identifying createServerFn().handler() calls
+    // 2. Extracting server functions to separate modules
+    // 3. Replacing call sites with RPC stubs
+    // 4. Generating the server function manifest
+    // Also handles createIsomorphicFn, createServerOnlyFn, createClientOnlyFn, createMiddleware
+    startCompilerPlugin({
       framework: corePluginOpts.framework,
-      directive,
       environments,
-    }),
-    TanStackServerFnPlugin({
-      // This is the ID that will be available to look up and import
-      // our server function manifest and resolve its module
-      manifestVirtualImportId: VIRTUAL_MODULES.serverFnManifest,
-      directive,
       generateFunctionId: startPluginOpts?.serverFns?.generateFunctionId,
-      callers: [
-        {
-          envConsumer: 'client',
-          getRuntimeCode: () =>
-            `import { createClientRpc } from '@tanstack/${corePluginOpts.framework}-start/client-rpc'`,
-          replacer: (d) => `createClientRpc('${d.functionId}')`,
-          envName: VITE_ENVIRONMENT_NAMES.client,
-        },
-        {
-          envConsumer: 'server' as const,
-          getRuntimeCode: () =>
-            `import { createSsrRpc } from '@tanstack/${corePluginOpts.framework}-start/ssr-rpc'`,
-          envName: VITE_ENVIRONMENT_NAMES.server,
-          replacer: (d: any) =>
-            // When the function is client-referenced, it's in the manifest - use manifest lookup
-            // When SSR is NOT the provider, always use manifest lookup (no import() for different env)
-            // Otherwise, use the importer for functions only referenced on the server when SSR is the provider
-            d.isClientReferenced || !ssrIsProvider
-              ? `createSsrRpc('${d.functionId}')`
-              : `createSsrRpc('${d.functionId}', () => import(${JSON.stringify(d.extractedFilename)}).then(m => m['${d.functionName}']))`,
-        },
-      ],
-      provider: {
-        getRuntimeCode: () =>
-          `import { createServerRpc } from '@tanstack/${corePluginOpts.framework}-start/server-rpc'`,
-        replacer: (d) => `createServerRpc('${d.functionId}', ${d.fn})`,
-        envName: serverFnProviderEnv,
-      },
+      providerEnvName: serverFnProviderEnv,
     }),
-    // Note: startCompilerPlugin functionality (createIsomorphicFn, createServerOnlyFn, createClientOnlyFn)
-    // is now merged into createServerFnPlugin above
+    importProtectionPlugin({
+      getConfig,
+      framework: corePluginOpts.framework,
+      environments,
+      providerEnvName: serverFnProviderEnv,
+    }),
+    tanStackStartRouter(startPluginOpts, getConfig, corePluginOpts),
     loadEnvPlugin(),
     startManifestPlugin({
       getClientBundle: () => getBundle(VITE_ENVIRONMENT_NAMES.client),
       getConfig,
     }),
-    devServerPlugin({ getConfig }),
+    // When the vite base and router basepath are misaligned (e.g. base: '/_ui/', basepath: '/'),
+    // install a middleware that rewrites incoming request URLs to prepend the vite base prefix.
+    // This allows Vite's internal base middleware to accept the requests, then strips the prefix
+    // before passing to the SSR handler.
+    // Registered BEFORE devServerPlugin so this middleware is added to the Connect stack first,
+    // ensuring all subsequent middlewares (CSS, SSR, etc.) see the rewritten URL.
+    {
+      name: 'tanstack-start-core:dev-base-rewrite',
+      configureServer(server) {
+        if (!needsDevBaseRewrite) {
+          return
+        }
+        const basePrefix = resolvedStartConfig.viteAppBase.replace(/\/$/, '')
+        server.middlewares.use((req, _res, next) => {
+          if (req.url && !req.url.startsWith(basePrefix)) {
+            req.url = basePrefix + req.url
+          }
+          next()
+        })
+      },
+    },
+    devServerPlugin({
+      getConfig,
+      devSsrStylesEnabled: startPluginOpts?.dev?.ssrStyles?.enabled ?? true,
+    }),
     previewServerPlugin(),
     {
       name: 'tanstack-start:core:capture-bundle',
