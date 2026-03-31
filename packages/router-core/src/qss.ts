@@ -39,26 +39,45 @@ export function encode(
 }
 
 /**
+ * Converts a string value to its appropriate type (string, number, boolean).
+ * @param str - The string value to convert.
+ * @returns The converted value.
+ * @example
+ * // Example input: toValue("123")
+ * // Expected output: 123
+ */
+function toValue(str: unknown) {
+  if (!str) return ''
+
+  if (str === 'false') return false
+  if (str === 'true') return true
+  return +str * 0 === 0 && +str + '' === str ? +str : str
+}
+
+/**
  * Decodes a query string into an object.
  * @param str - The query string to decode.
+ * @param inferTypes - Enable / disable type inference
  * @returns The decoded key-value pairs in an object format.
  * @example
  * // Example input: decode("token=foo&key=value")
  * // Expected output: { "token": "foo", "key": "value" }
  */
-export function decode(str: any): any {
+export function decode(str: any, { inferTypes }: { inferTypes: boolean }): any {
   const searchParams = new URLSearchParams(str)
 
   const result: Record<string, unknown> = Object.create(null)
 
   for (const [key, value] of searchParams.entries()) {
     const previousValue = result[key]
+    const newValue = inferTypes ? toValue(value) : value
+
     if (previousValue == null) {
-      result[key] = value
+      result[key] = newValue
     } else if (Array.isArray(previousValue)) {
-      previousValue.push(value)
+      previousValue.push(newValue)
     } else {
-      result[key] = [previousValue, value]
+      result[key] = [previousValue, newValue]
     }
   }
 
