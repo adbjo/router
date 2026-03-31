@@ -12,8 +12,8 @@ export const defaultStringifySearch = stringifySearchWith()
  * The returned function strips a leading `?`, decodes values, and attempts to
  * JSON-parse string values using the given `parser`.
  *
- * @param parser Function to parse a string value (e.g. `JSON.parse`).
- * @param inferTypes Enable / disable type inference
+ * @param parser Function to parse a string value (e.g. `JSON.parse`), or `null` to skip parsing
+ * @param inferTypes Enable / disable type inference.
  * @returns A `parseSearch` function compatible with `Router` options.
  * @link https://tanstack.com/router/latest/docs/framework/react/guide/custom-search-param-serialization
  */
@@ -54,7 +54,7 @@ export function parseSearchWith(
  * supplied, string values that are parseable are re-serialized to ensure
  * symmetry with `parseSearch`.
  *
- * @param stringify Function to serialize a value (e.g. `JSON.stringify`).
+ * @param stringify Function to serialize a value (e.g. `JSON.stringify`), or `null` to skip serialization
  * @param parser Optional parser to detect parseable strings.
  * @returns A `stringifySearch` function compatible with `Router` options.
  * @link https://tanstack.com/router/latest/docs/framework/react/guide/custom-search-param-serialization
